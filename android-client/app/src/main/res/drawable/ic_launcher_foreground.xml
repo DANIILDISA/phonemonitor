@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Передний план адаптивной иконки: схематичный монитор и телефон.
+     Векторный, чтобы не тащить растровые ресурсы под каждую плотность. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Корпус монитора -->
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M28,34 h40 a3,3 0 0 1 3,3 v26 a3,3 0 0 1 -3,3 h-40 a3,3 0 0 1 -3,-3 v-26 a3,3 0 0 1 3,-3 z" />
+    <!-- Экран монитора -->
+    <path
+        android:fillColor="#0F1720"
+        android:pathData="M29,38 h38 v24 h-38 z" />
+    <!-- Подставка -->
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M42,66 h12 v5 h-12 z M36,71 h24 v3 h-24 z" />
+    <!-- Телефон справа -->
+    <path
+        android:fillColor="#81C784"
+        android:pathData="M74,40 h12 a2,2 0 0 1 2,2 v30 a2,2 0 0 1 -2,2 h-12 a2,2 0 0 1 -2,-2 v-30 a2,2 0 0 1 2,-2 z" />
+    <path
+        android:fillColor="#0F1720"
+        android:pathData="M74,44 h12 v25 h-12 z" />
+</vector>

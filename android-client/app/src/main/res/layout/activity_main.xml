@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  =============================================================================
+   Разметка главного экрана.
+  =============================================================================
+
+   Иерархия предельно плоская: SurfaceView и накладка состояния поверх него.
+   Каждый лишний уровень вложенности - это дополнительная работа композитора
+   на каждом кадре, а значит и дополнительная задержка.
+
+   SurfaceView, а не TextureView: SurfaceView отдаёт декодеру отдельный слой
+   аппаратного композитора, минуя конвейер отрисовки приложения. TextureView
+   потребовал бы прохода через GPU приложения и добавил бы кадр задержки.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/rootLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    android:keepScreenOn="true">
+
+    <!-- Поверхность вывода видео. Размер выставляется программно после
+         получения геометрии потока, чтобы сохранить пропорции. -->
+    <SurfaceView
+        android:id="@+id/videoSurface"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
+
+    <!-- Накладка состояния. Видима только до прихода первого кадра и при
+         разрыве соединения. -->
+    <LinearLayout
+        android:id="@+id/statusOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="32dp"
+        android:background="#CC000000">
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="@android:color/white"
+            android:textSize="20sp"
+            android:gravity="center"
+            tools:text="Ожидание подключения компьютера…" />
+
+        <TextView
+            android:id="@+id/hintText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:textColor="#B0B0B0"
+            android:textSize="14sp"
+            android:gravity="center"
+            android:text="@string/hint_usb" />
+
+        <TextView
+            android:id="@+id/diagnosticsText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:textColor="#808080"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:gravity="center"
+            tools:text="Слушаем порт 6100" />
+    </LinearLayout>
+</FrameLayout>

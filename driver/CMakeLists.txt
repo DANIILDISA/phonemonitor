@@ -1,0 +1,189 @@
+# =============================================================================
+#  PhoneMonitor IDD - сборка драйвера косвенного дисплея (UMDF 2.0 + IddCx).
+# =============================================================================
+#
+#  Драйвер UMDF 2.0 - это обычная DLL, которую загружает WUDFHost.exe.
+#  Поэтому CMake здесь применим, но требует ручного указания путей WDK:
+#  штатного find-модуля для WDK в CMake нет.
+#
+#  Пример вызова:
+#      cmake -S driver -B build/driver -G "Visual Studio 17 2022" -A x64 ^
+#            -DWDK_ROOT="C:/Program Files (x86)/Windows Kits/10" ^
+#            -DWDK_VERSION=10.0.26100.0 ^
+#            -DUMDF_VERSION=2.33
+#      cmake --build build/driver --config Release
+#
+#  Результат: build/driver/Release/PhoneMonitorIdd.dll
+#  Для установки нужен ещё PhoneMonitor.inf и подпись (см. docs/BUILD.md).
+# =============================================================================
+
+cmake_minimum_required(VERSION 3.21)
+project(PhoneMonitorIdd LANGUAGES CXX)
+
+if(NOT WIN32)
+    message(FATAL_ERROR "Драйвер IDD собирается только под Windows")
+endif()
+
+if(NOT MSVC)
+    message(FATAL_ERROR "Требуется компилятор MSVC: UMDF-заголовки несовместимы с MinGW/Clang-GNU")
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# -----------------------------------------------------------------------------
+#  Поиск Windows Driver Kit
+# -----------------------------------------------------------------------------
+set(WDK_ROOT "C:/Program Files (x86)/Windows Kits/10" CACHE PATH
+    "Корень Windows Kits 10 (там лежат Include/, Lib/)")
+
+# Версия SDK/WDK. Если не задана явно, берём самую свежую из Include/.
+set(WDK_VERSION "" CACHE STRING "Версия WDK, например 10.0.26100.0")
+
+if(WDK_VERSION STREQUAL "")
+    file(GLOB _wdk_versions RELATIVE "${WDK_ROOT}/Include" "${WDK_ROOT}/Include/10.*")
+    if(_wdk_versions)
+        list(SORT _wdk_versions)
+        list(REVERSE _wdk_versions)
+        list(GET _wdk_versions 0 WDK_VERSION)
+        message(STATUS "Версия WDK определена автоматически: ${WDK_VERSION}")
+    else()
+        message(FATAL_ERROR "Не удалось найти WDK в ${WDK_ROOT}. Задайте -DWDK_ROOT и -DWDK_VERSION")
+    endif()
+endif()
+
+# Версия UMDF. Определяет подкаталог в Lib/wdf/umdf и значение макроса
+# UMDF_VERSION_MINOR, который обязан совпадать с линкуемой stub-библиотекой.
+set(UMDF_VERSION "2.33" CACHE STRING "Версия UMDF, например 2.33")
+string(REPLACE "." ";" _umdf_parts "${UMDF_VERSION}")
+list(GET _umdf_parts 0 UMDF_VERSION_MAJOR)
+list(GET _umdf_parts 1 UMDF_VERSION_MINOR)
+
+set(_wdk_inc "${WDK_ROOT}/Include/${WDK_VERSION}")
+set(_wdk_lib "${WDK_ROOT}/Lib/${WDK_VERSION}")
+
+foreach(_required
+        "${_wdk_inc}/um"
+        "${_wdk_inc}/shared"
+        "${_wdk_inc}/wdf/umdf/${UMDF_VERSION}")
+    if(NOT EXISTS "${_required}")
+        message(FATAL_ERROR "Отсутствует обязательный каталог WDK: ${_required}")
+    endif()
+endforeach()
+
+# -----------------------------------------------------------------------------
+#  Цель
+# -----------------------------------------------------------------------------
+add_library(PhoneMonitorIdd SHARED
+    src/Driver.cpp
+    src/Direct3DDevice.cpp
+    src/IpcServer.cpp
+    src/MonitorModes.cpp
+    src/SwapChainProcessor.cpp
+    src/Driver.h
+    src/Direct3DDevice.h
+    src/IpcServer.h
+    src/MonitorModes.h
+    src/SwapChainProcessor.h
+    src/Trace.h
+    ../common/pm_ipc.h
+)
+
+target_include_directories(PhoneMonitorIdd PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../common"
+    # Порядок важен: wdf/umdf должен идти ПЕРЕД um, иначе подхватится
+    # пользовательский wdf.h вместо драйверного.
+    "${_wdk_inc}/wdf/umdf/${UMDF_VERSION}"
+    "${_wdk_inc}/um"
+    "${_wdk_inc}/shared"
+)
+
+target_compile_definitions(PhoneMonitorIdd PRIVATE
+    UMDF_VERSION_MAJOR=${UMDF_VERSION_MAJOR}
+    UMDF_VERSION_MINOR=${UMDF_VERSION_MINOR}
+    # Без UMDF_USING_NTSTATUS заголовки WDF объявят HRESULT там, где IddCx
+    # ожидает NTSTATUS, и весь файл Driver.cpp перестанет компилироваться.
+    UMDF_USING_NTSTATUS
+    _UNICODE
+    UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    # Минимальная поддерживаемая версия: Windows 10 1903 (там появился
+    # IddCx 1.4 с нужными нам возможностями).
+    _WIN32_WINNT=0x0A00
+    WINVER=0x0A00
+)
+
+# Быстрый путь IddCxMonitorUpdateModes доступен начиная с IddCx 1.9.
+# Проверяем наличие функции в заголовке и включаем соответствующую ветку кода.
+file(READ "${_wdk_inc}/um/IddCx.h" _iddcx_header LIMIT 400000)
+if(_iddcx_header MATCHES "IddCxMonitorUpdateModes")
+    message(STATUS "IddCx поддерживает MonitorUpdateModes - включён быстрый путь смены режима")
+    target_compile_definitions(PhoneMonitorIdd PRIVATE PM_HAVE_IDDCX_UPDATEMODES)
+else()
+    message(STATUS "IddCxMonitorUpdateModes не найден - смена режима через departure/arrival")
+endif()
+
+target_compile_options(PhoneMonitorIdd PRIVATE
+    /W4
+    /permissive-
+    # Исключения нужны: std::vector может бросить bad_alloc. UMDF это допускает,
+    # в отличие от KMDF.
+    /EHsc
+    $<$<CONFIG:Release>:/O2>
+    $<$<CONFIG:Release>:/GL>
+    $<$<CONFIG:Debug>:/Od>
+)
+
+# -----------------------------------------------------------------------------
+#  Линковка
+# -----------------------------------------------------------------------------
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(_arch "x64")
+else()
+    set(_arch "x86")
+endif()
+
+set(_umdf_lib_dir "${_wdk_lib}/wdf/umdf/${_arch}/${UMDF_VERSION}")
+if(NOT EXISTS "${_umdf_lib_dir}")
+    message(FATAL_ERROR "Не найден каталог библиотек UMDF: ${_umdf_lib_dir}")
+endif()
+
+target_link_directories(PhoneMonitorIdd PRIVATE
+    "${_umdf_lib_dir}"
+    "${_wdk_lib}/um/${_arch}"
+)
+
+target_link_libraries(PhoneMonitorIdd PRIVATE
+    # Заглушка UMDF: содержит DllMain, который вызывает наш DriverEntry.
+    WdfDriverStubUm.lib
+    # Заглушка расширения класса косвенных дисплеев.
+    IddCxStub.lib
+    d3d11.lib
+    dxgi.lib
+    dxguid.lib
+    avrt.lib      # AvSetMmThreadCharacteristics
+    ole32.lib     # CoCreateGuid
+    advapi32.lib  # ConvertStringSecurityDescriptorToSecurityDescriptorW
+    kernel32.lib
+    user32.lib
+)
+
+set_target_properties(PhoneMonitorIdd PROPERTIES
+    OUTPUT_NAME "PhoneMonitorIdd"
+    SUFFIX ".dll"
+    # Драйвер обязан быть собран без стандартной библиотеки CRT-инициализации
+    # в DllMain: WdfDriverStubUm сам управляет точкой входа.
+    LINK_FLAGS "/SUBSYSTEM:WINDOWS /NODEFAULTLIB:libucrt.lib"
+)
+
+# INF копируем рядом с DLL: установщик ожидает их в одной папке.
+add_custom_command(TARGET PhoneMonitorIdd POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/PhoneMonitor.inf"
+        "$<TARGET_FILE_DIR:PhoneMonitorIdd>/PhoneMonitor.inf"
+    COMMENT "Копирование INF-файла рядом с драйвером"
+)
+
+message(STATUS "PhoneMonitor IDD: WDK=${WDK_VERSION}, UMDF=${UMDF_VERSION}, архитектура=${_arch}")

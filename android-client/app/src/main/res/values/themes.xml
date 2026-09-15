@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Базовая тема. Чёрный фон принципиален: любые незакрашенные области
+         поверхности не должны бросаться в глаза, а на OLED это ещё и экономит
+         энергию, что напрямую влияет на нагрев. -->
+    <style name="Theme.PhoneMonitor" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:colorBackground">@android:color/black</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
+        <item name="android:statusBarColor">@android:color/black</item>
+    </style>
+
+    <!-- Полноэкранная тема активности монитора. -->
+    <style name="Theme.PhoneMonitor.Fullscreen" parent="Theme.PhoneMonitor">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <!-- Отключаем анимацию входа: лишние кадры композитора на старте
+             задерживают появление первого кадра видео. -->
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="p">shortEdges</item>
+    </style>
+</resources>

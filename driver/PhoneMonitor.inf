@@ -1,0 +1,98 @@
+; =============================================================================
+;  PhoneMonitor.inf - установочный файл драйвера косвенного дисплея.
+; =============================================================================
+;
+;  Класс Display + подкласс IndirectDisplay: именно эта пара заставляет
+;  PnP-менеджер загрузить драйвер под управлением IddCx, а не пытаться
+;  обращаться к нему как к обычному видеоадаптеру.
+;
+;  Устройство не имеет физического оборудования, поэтому узел создаётся
+;  вручную корневым перечислителем (root enumerator):
+;      pnputil /add-driver PhoneMonitor.inf /install
+;      devgen /add /hardwareid "Root\PhoneMonitorIdd"
+;  либо через devcon:
+;      devcon install PhoneMonitor.inf Root\PhoneMonitorIdd
+;
+;  ВАЖНО: начиная с Windows 10 1607 неподписанные драйверы не загружаются.
+;  Для разработки включите тестовый режим:
+;      bcdedit /set testsigning on
+;  и подпишите пакет тестовым сертификатом (см. docs/BUILD.md).
+; =============================================================================
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = PhoneMonitor.cat
+DriverVer   = 09/14/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard, NTamd64.10.0...16299
+
+[Standard.NTamd64.10.0...16299]
+%DeviceName% = PhoneMonitor_Install, Root\PhoneMonitorIdd
+
+; -----------------------------------------------------------------------------
+;  Файлы, копируемые в систему
+; -----------------------------------------------------------------------------
+[SourceDisksFiles]
+PhoneMonitorIdd.dll = 1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[DestinationDirs]
+; 13 - каталог DriverStore того же пакета. Обязателен при PnpLockdown=1:
+; копирование в System32 для UMDF-драйверов больше не допускается.
+UMDriverCopy = 13
+
+[PhoneMonitor_Install.NT]
+CopyFiles = UMDriverCopy
+
+[PhoneMonitor_Install.NT.hw]
+AddReg = PhoneMonitor_HardwareDeviceSettings
+
+[PhoneMonitor_Install.NT.Services]
+AddService = WUDFRd, 0x000001fa, WUDFRD_ServiceInstall
+
+[PhoneMonitor_Install.NT.Wdf]
+; Идентификатор класса UMDF-драйвера и его хост-процесса.
+UmdfService              = PhoneMonitorIdd, PhoneMonitor_Install
+UmdfServiceOrder         = PhoneMonitorIdd
+; Уровень изоляции хоста. Для косвенных дисплеев требуется устройство,
+; работающее в контексте сессии 0 с правами системы.
+UmdfHostProcessSharing   = ProcessSharingDisabled
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction  = Copy
+
+[PhoneMonitor_Install]
+UmdfLibraryVersion = 2.33.0
+ServiceBinary      = %13%\PhoneMonitorIdd.dll
+DriverCLSID        = {4A1EB2A5-8B7D-4D63-9E2A-3F1C0D5B7E41}
+
+[UMDriverCopy]
+PhoneMonitorIdd.dll
+
+[WUDFRD_ServiceInstall]
+DisplayName   = %WudfRdDisplayName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[PhoneMonitor_HardwareDeviceSettings]
+; Косвенный дисплей обязан объявить себя таковым, иначе IddCx откажется
+; инициализировать адаптер с ошибкой STATUS_DEVICE_CONFIGURATION_ERROR.
+HKR,, "UpperFilters", 0x00010000, "IndirectKmd"
+
+; -----------------------------------------------------------------------------
+;  Строки
+; -----------------------------------------------------------------------------
+[Strings]
+ManufacturerName  = "PhoneMonitor Project"
+DiskName          = "PhoneMonitor Installation Disk"
+DeviceName        = "PhoneMonitor Virtual Display (USB)"
+WudfRdDisplayName = "Windows Driver Foundation - User-mode Driver Framework Reflector"

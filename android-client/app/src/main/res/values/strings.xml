@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PhoneMonitor</string>
+
+    <!-- Состояния подключения, показываемые поверх поверхности до прихода
+         первого кадра. После начала показа накладка скрывается. -->
+    <string name="status_waiting">Ожидание подключения компьютера…</string>
+    <string name="status_port">Слушаем порт %1$d</string>
+    <string name="status_connected">Компьютер подключён: %1$s</string>
+    <string name="status_decoding">Идёт приём изображения</string>
+    <string name="status_disconnected">Соединение разорвано. Ожидание нового…</string>
+    <string name="status_error">Ошибка: %1$s</string>
+
+    <string name="hint_usb">Подключите телефон кабелем и запустите phonemonitor-streamer.exe на компьютере</string>
+</resources>

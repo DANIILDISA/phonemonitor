@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  =============================================================================
+   Манифест PhoneMonitor Client.
+  =============================================================================
+
+   Разрешения:
+     * INTERNET - нужен даже для петлевого сокета: ServerSocket на 127.0.0.1
+       всё равно проходит проверку разрешения на сетевые операции.
+     * WAKE_LOCK - экран не должен гаснуть во время работы монитором;
+       используется через flag keepScreenOn, разрешение нужно системе
+       для корректного учёта.
+     * FOREGROUND_SERVICE не запрашивается: приложение работает только пока
+       открыт его экран, фоновая работа монитору не нужна.
+
+   Активность объявлена singleTask с landscape-нейтральной ориентацией:
+   ориентацию выбирает пользователь, а приложение подстраивает геометрию
+   под фактические размеры поверхности.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Требуется аппаратный декодер H.264. Устройств без него в поле
+         действия minSdk 26 практически нет, но объявить нужно. -->
+    <uses-feature
+        android:name="android.hardware.screen.landscape"
+        android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PhoneMonitor"
+        android:hardwareAccelerated="true"
+        android:largeHeap="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="fullSensor"
+            android:theme="@style/Theme.PhoneMonitor.Fullscreen"
+            android:turnScreenOn="true"
+            android:showWhenLocked="true"
+            android:resizeableActivity="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Цвет подложки адаптивной иконки. -->
+    <color name="ic_launcher_background">#0F1720</color>
+</resources>
