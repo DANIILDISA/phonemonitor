@@ -25,8 +25,7 @@
  *  вытеснять его фоновыми задачами, и дрожание (jitter) захвата падает в разы.
  */
 
-#include <windows.h>
-#include <iddcx.h>
+#include "DriverCommon.h"
 #include <d3d11_4.h>
 #include <wrl/client.h>
 #include <memory>

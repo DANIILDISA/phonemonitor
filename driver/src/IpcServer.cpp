@@ -426,10 +426,22 @@ namespace pm
         // текстуру как SRV, а без этого флага он не сможет создать вид.
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
         desc.CPUAccessFlags = 0;
-        // Пара флагов SHARED | SHARED_NTHANDLE - единственная комбинация,
-        // при которой работает CreateSharedHandle с именем и последующий
-        // OpenSharedResourceByName на стороне стримера.
-        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+        // ---------------------------------------------------------------------
+        // SHARED_KEYEDMUTEX вместо SHARED - это ключевое решение.
+        //
+        // Ключевой мьютекс открывается ВМЕСТЕ с текстурой по её имени и не
+        // требует ни передачи хендлов между процессами, ни каких-либо
+        // привилегий. Это единственный способ синхронизации, работающий в нашей
+        // связке: драйвер живёт в WUDFHost.exe под ограниченной учётной записью
+        // и получает отказ в доступе при попытке OpenProcess на пользовательский
+        // процесс, а стример без прав администратора не может открыть WUDFHost.
+        //
+        // Флаги SHARED и SHARED_KEYEDMUTEX взаимоисключающие; рабочая
+        // комбинация - SHARED_KEYEDMUTEX | SHARED_NTHANDLE, при которой
+        // работают CreateSharedHandle с именем и OpenSharedResourceByName.
+        // ---------------------------------------------------------------------
+        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                         D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
 
         HRESULT hr = S_OK;
         for (uint32_t i = 0; i < PM_RING_SLOTS; ++i)
@@ -547,25 +559,53 @@ namespace pm
             return E_UNEXPECTED;
         }
 
+        // ---------------------------------------------------------------------
+        // Захват ключевого мьютекса слота.
+        //
+        // Ключ 0 используется обеими сторонами и на захват, и на освобождение:
+        // мьютекс работает как обычный взаимоисключающий замок, а «есть ли
+        // новый кадр» сообщает счётчик frameIndex в разделяемой памяти.
+        // Асимметричные ключи (0 для писателя, 1 для читателя) выглядят
+        // изящнее, но приводят к зависанию писателя, когда читателя нет:
+        // мьютекс остаётся на чужом ключе, и следующий AcquireSync не проходит.
+        //
+        // Таймаут 8 мс - меньше половины кадра при 60 Гц. Если стример почему-то
+        // держит слот дольше, честнее пропустить кадр, чем задержать весь
+        // конвейер захвата: композитор ждёт нашего FinishedProcessingFrame.
+        // ---------------------------------------------------------------------
+        Microsoft::WRL::ComPtr<IDXGIKeyedMutex> keyedMutex;
+        hr = m_slotTextures[slot].As(&keyedMutex);
+        if (FAILED(hr))
+        {
+            LeaveCriticalSection(&m_resourceLock);
+            PM_LOG_ERROR(L"Слот %u не предоставляет IDXGIKeyedMutex, HRESULT=0x%08X", slot, hr);
+            return hr;
+        }
+
+        hr = keyedMutex->AcquireSync(0, 8);
+        if (hr != S_OK)
+        {
+            LeaveCriticalSection(&m_resourceLock);
+            // WAIT_TIMEOUT здесь - штатная ситуация под нагрузкой, не ошибка.
+            PM_LOG_TRACE(L"Слот %u занят потребителем, кадр пропущен (0x%08X)", slot, hr);
+            return S_FALSE;
+        }
+
         // Копия целиком: swapchain отдаёт поверхность в состоянии, пригодном
         // для чтения GPU, а CopyResource на одном устройстве - это чистая
         // блитовая операция без синхронизации с CPU.
         m_device->Context()->CopyResource(m_slotTextures[slot].Get(), source);
 
-        // Значение фенса увеличиваем ПЕРЕД Signal: стример будет ждать именно
-        // этого числа, и оно должно быть строго больше предыдущего.
-        const uint64_t fenceValue = ++m_fenceCounter;
-        hr = m_device->Context4()->Signal(m_fence.Get(), fenceValue);
-        if (FAILED(hr))
-        {
-            LeaveCriticalSection(&m_resourceLock);
-            PM_LOG_ERROR(L"Signal по фенсу завершился ошибкой 0x%08X", hr);
-            return hr;
-        }
-
-        // Немедленный сброс командного буфера. Без Flush копия может пролежать
-        // в очереди драйвера десятки миллисекунд - ровно то, чего мы избегаем.
+        // Немедленный сброс командного буфера ДО освобождения мьютекса:
+        // иначе стример может захватить слот раньше, чем копия реально
+        // исполнится на GPU, и прочитает предыдущий кадр.
         m_device->Context()->Flush();
+
+        keyedMutex->ReleaseSync(0);
+
+        // Счётчик фенса сохраняем только как порядковый номер кадра для
+        // телеметрии: сам фенс в синхронизации больше не участвует.
+        const uint64_t fenceValue = ++m_fenceCounter;
 
         m_nextSlot = (m_nextSlot + 1) % PM_RING_SLOTS;
 
@@ -646,6 +686,23 @@ namespace pm
 
     void IpcServer::HandleFenceHandleRequest() noexcept
     {
+        // Схема передачи хендла фенса через DuplicateHandle не работает в этой
+        // связке: WUDFHost.exe выполняется под ограниченной учётной записью и
+        // получает ERROR_ACCESS_DENIED на OpenProcess(PROCESS_DUP_HANDLE) для
+        // пользовательского процесса. Синхронизация переведена на ключевой
+        // мьютекс общей текстуры, который не требует передачи хендлов вообще.
+        //
+        // Обработчик сохранён, чтобы старый стример не завис в ожидании ответа:
+        // он получает событие с нулевым хендлом и переходит к работе без фенса.
+        PM_LOG_INFO(L"Запрос хендла фенса получен, но фенс больше не используется - "
+                    L"синхронизация идёт через ключевой мьютекс текстуры");
+        m_header->fenceHandleValue = 0;
+        m_header->fenceHandleOwnerPid = 0;
+        MemoryBarrier();
+        ++m_header->fenceHandleSerial;
+        SetEvent(m_evtHandleReady);
+        return;
+
         const DWORD streamerPid = m_header->streamerPid;
         if (streamerPid == 0)
         {

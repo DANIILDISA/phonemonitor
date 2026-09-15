@@ -47,28 +47,48 @@ namespace pm
             return 3;
         }
 
-        /* Установка свойства ICodecAPI с мягкой обработкой отказа:
-           не все MFT поддерживают весь набор, и это нормально. */
-        void TrySetCodecProperty(ICodecAPI* api, const GUID& property,
-                                 const VARIANT& value, const char* description) noexcept
+        /*
+         * Установка свойства ICodecAPI с мягкой обработкой отказа:
+         * не все MFT поддерживают весь набор, и это нормально.
+         *
+         * VARIANT передаётся ПО ЗНАЧЕНИЮ, а не по константной ссылке:
+         * сигнатура ICodecAPI::SetValue объявлена как
+         *     HRESULT SetValue(const GUID*, VARIANT*)
+         * то есть второй аргумент неконстантный. Копия на стеке и дешевле,
+         * и безопаснее, чем const_cast над чужим объектом.
+         *
+         * Возвращает true, если свойство реально принято кодировщиком.
+         */
+        bool TrySetCodecProperty(ICodecAPI* api, const GUID& property,
+                                 VARIANT value, const char* description,
+                                 bool quiet = false) noexcept
         {
-            if (api == nullptr) return;
+            if (api == nullptr) return false;
 
             if (api->IsSupported(&property) != S_OK)
             {
-                PM_TRACE("MFT: свойство \"%s\" не поддерживается - пропускаем", description);
-                return;
+                if (!quiet)
+                {
+                    PM_TRACE("MFT: свойство \"%s\" не поддерживается - пропускаем", description);
+                }
+                return false;
             }
 
             const HRESULT hr = api->SetValue(&property, &value);
             if (FAILED(hr))
             {
-                PM_WARN("MFT: не удалось установить \"%s\": %s", description, HResultToText(hr));
+                if (!quiet)
+                {
+                    PM_WARN("MFT: не удалось установить \"%s\": %s", description, HResultToText(hr));
+                }
+                return false;
             }
-            else
+
+            if (!quiet)
             {
                 PM_INFO("MFT: установлено \"%s\"", description);
             }
+            return true;
         }
 
         VARIANT VarU32(uint32_t v) noexcept
@@ -636,20 +656,61 @@ namespace pm
         TrySetCodecProperty(m_codecApi.Get(), CODECAPI_AVEncCommonQualityVsSpeed,
             VarU32(33), "баланс качество/скорость в пользу скорости");
 
-        /*
-         * О Intra-Refresh.
-         *
-         * ICodecAPI не содержит переносимого свойства для управления волной
-         * внутрикадрового обновления: у AMD и Intel это приватные расширения
-         * их собственных SDK. Поэтому на этом бэкенде устойчивость потока
-         * обеспечивается иначе (см. комментарий в заголовке класса):
-         * гарантированная доставка TCP + ключевой кадр по запросу клиента.
-         * Полноценный Intra-Refresh доступен на бэкенде NVENC.
-         */
+        // --- Intra-Refresh --------------------------------------------------------
+        //
+        // Переносимое свойство для управления волной внутрикадрового обновления
+        // в ICodecAPI всё-таки есть: CODECAPI_AVEncVideoGradualIntraRefresh.
+        // Поддерживают его не все MFT, поэтому работаем через проверку
+        // IsSupported и фактический результат SetValue.
+        //
+        // Тип значения в заголовке WDK не документирован, а у разных
+        // производителей трактуется по-разному: одни ждут число кадров, за
+        // которое волна проходит кадр целиком, другие - простой флаг
+        // включения. Поэтому пробуем оба варианта по очереди и сообщаем в
+        // журнал, какой сработал. Это надёжнее, чем угадывать.
         if (m_config.intraRefreshEnabled)
         {
-            PM_WARN("Intra-Refresh недоступен на пути Media Foundation. "
-                    "Используется выдача IDR по запросу клиента");
+            const uint32_t bandPercent = (m_config.intraRefreshBandPercent > 0 &&
+                                          m_config.intraRefreshBandPercent <= 100)
+                ? m_config.intraRefreshBandPercent : 5;
+            // 5% ширины за кадр -> полный проход за 20 кадров.
+            const uint32_t refreshFrames = (100 + bandPercent - 1) / bandPercent;
+
+            bool applied = TrySetCodecProperty(m_codecApi.Get(),
+                CODECAPI_AVEncVideoGradualIntraRefresh,
+                VarU32(refreshFrames),
+                "постепенное внутрикадровое обновление (число кадров)",
+                /*quiet*/ true);
+
+            if (applied)
+            {
+                PM_INFO("Intra-Refresh включён: полоса %u%% ширины кадра, полный проход за %u кадров",
+                    bandPercent, refreshFrames);
+            }
+            else
+            {
+                applied = TrySetCodecProperty(m_codecApi.Get(),
+                    CODECAPI_AVEncVideoGradualIntraRefresh,
+                    VarBool(true),
+                    "постепенное внутрикадровое обновление (флаг)",
+                    /*quiet*/ true);
+
+                if (applied)
+                {
+                    PM_INFO("Intra-Refresh включён флагом: шаг волны выбирает сам кодировщик");
+                }
+            }
+
+            m_intraRefreshActive = applied;
+
+            if (!applied)
+            {
+                // Честный откат: этот MFT волну обновления не поддерживает.
+                // Устойчивость обеспечим гарантированной доставкой TCP и
+                // выдачей IDR по запросу клиента (PM_MSG_KEYFRAME_REQ).
+                PM_WARN("Кодировщик не принял Intra-Refresh. "
+                        "Восстановление после сбоев - через ключевой кадр по запросу клиента");
+            }
         }
     }
 

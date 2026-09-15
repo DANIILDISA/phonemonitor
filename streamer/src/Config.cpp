@@ -106,6 +106,7 @@ namespace pm
             if (Matches(argument, L"-h", L"--help") || _wcsicmp(argument, L"/?") == 0)
             {
                 PrintUsage();
+                config.helpRequested = true;
                 return false;
             }
             else if (Matches(argument, nullptr, L"--port"))

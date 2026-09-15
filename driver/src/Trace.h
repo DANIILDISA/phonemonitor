@@ -22,7 +22,7 @@
  *  условия внутри do/while.
  */
 
-#include <windows.h>
+#include "DriverCommon.h"
 #include <strsafe.h>
 
  /* Уровни детализации. Чем меньше число - тем важнее сообщение. */
@@ -39,8 +39,86 @@
 #endif
 #endif
 
+/*
+ * Файл журнала драйвера.
+ *
+ * OutputDebugStringW из сессии 0 виден только глобальному отладчику
+ * (DebugView с Capture Global Win32), а это требует отдельного запуска от
+ * администратора и не годится для автоматической диагностики. Поэтому
+ * дублируем вывод в файл, который может прочитать кто угодно.
+ *
+ * Каталог ProgramData выбран потому, что WUDFHost.exe работает как SYSTEM и
+ * имеет туда доступ на запись при любой конфигурации системы, в отличие от
+ * профиля пользователя, которого у службы просто нет.
+ */
+#define PM_LOG_DIR   L"C:\\ProgramData\\PhoneMonitor"
+#define PM_LOG_PATH  L"C:\\ProgramData\\PhoneMonitor\\driver.log"
+
 namespace pm
 {
+    namespace detail
+    {
+        /*
+         * Ленивая инициализация файла журнала.
+         *
+         * Открываем один раз на процесс и держим хендл до выгрузки.
+         * FILE_APPEND_DATA вместо GENERIC_WRITE: запись атомарно добавляется в
+         * конец, поэтому несколько потоков драйвера не перетирают друг друга
+         * даже без блокировки.
+         *
+         * FILE_SHARE_READ | FILE_SHARE_WRITE обязательны: без них файл нельзя
+         * будет открыть на чтение, пока драйвер работает, а нам нужно смотреть
+         * журнал именно вживую.
+         */
+        inline HANDLE GetLogFile() noexcept
+        {
+            static HANDLE handle = INVALID_HANDLE_VALUE;
+            static LONG initialized = 0;
+
+            // Однократная инициализация без блокировки: гонка максимум
+            // приведёт к лишнему CreateDirectory, что безвредно.
+            if (InterlockedCompareExchange(&initialized, 1, 0) == 0)
+            {
+                CreateDirectoryW(PM_LOG_DIR, nullptr);
+
+                handle = CreateFileW(
+                    PM_LOG_PATH,
+                    FILE_APPEND_DATA,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr,
+                    OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL,
+                    nullptr);
+            }
+
+            return handle;
+        }
+
+        /* Запись строки в файл журнала в UTF-8. */
+        inline void WriteLogFile(const wchar_t* line) noexcept
+        {
+            const HANDLE file = GetLogFile();
+            if (file == INVALID_HANDLE_VALUE || file == nullptr)
+            {
+                return;
+            }
+
+            char utf8[1024];
+            const int bytes = WideCharToMultiByte(
+                CP_UTF8, 0, line, -1, utf8, static_cast<int>(sizeof(utf8)), nullptr, nullptr);
+
+            if (bytes > 1)
+            {
+                DWORD written = 0;
+                // bytes - 1: нуль-терминатор в файл не пишем.
+                WriteFile(file, utf8, static_cast<DWORD>(bytes - 1), &written, nullptr);
+                // Немедленный сброс: если драйвер сейчас упадёт, последняя
+                // строка - самая важная, и потерять её нельзя.
+                FlushFileBuffers(file);
+            }
+        }
+    }
+
     /*
      * Форматирует и выводит одну строку журнала.
      * Буфер намеренно лежит на стеке: выделение кучи в пути захвата кадра -
@@ -49,7 +127,7 @@ namespace pm
     inline void TraceWrite(const wchar_t* level, const wchar_t* format, ...) noexcept
     {
         wchar_t body[512];
-        wchar_t line[640];
+        wchar_t line[700];
 
         va_list args;
         va_start(args, format);
@@ -57,11 +135,16 @@ namespace pm
         (void)StringCchVPrintfW(body, ARRAYSIZE(body), format, args);
         va_end(args);
 
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+
         (void)StringCchPrintfW(line, ARRAYSIZE(line),
-            L"[PhoneMonitor][%s][tid=%lu] %s\n",
-            level, GetCurrentThreadId(), body);
+            L"[%02u:%02u:%02u.%03u][PhoneMonitor][%s][pid=%lu tid=%lu] %s\r\n",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            level, GetCurrentProcessId(), GetCurrentThreadId(), body);
 
         OutputDebugStringW(line);
+        detail::WriteLogFile(line);
     }
 }
 

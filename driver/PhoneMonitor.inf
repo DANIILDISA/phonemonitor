@@ -25,7 +25,7 @@ Class       = Display
 ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
 Provider    = %ManufacturerName%
 CatalogFile = PhoneMonitor.cat
-DriverVer   = 09/14/2026,1.0.0.0
+DriverVer   = 09/15/2026,1.0.4.0
 PnpLockdown = 1
 
 [Manufacturer]
@@ -71,7 +71,24 @@ UmdfMethodNeitherAction  = Copy
 [PhoneMonitor_Install]
 UmdfLibraryVersion = 2.33.0
 ServiceBinary      = %13%\PhoneMonitorIdd.dll
-DriverCLSID        = {4A1EB2A5-8B7D-4D63-9E2A-3F1C0D5B7E41}
+
+; Подключение расширения класса косвенных дисплеев.
+;
+; БЕЗ ЭТОЙ СТРОКИ ДРАЙВЕР НЕ РАБОТАЕТ. Расширение IddCx не привязывается к
+; драйверу, IddCxDeviceInitConfig не может отработать, EvtDriverDeviceAdd
+; возвращает ошибку, и устройство получает код проблемы 31
+; (CM_PROB_FAILED_ADD) со статусом 0xc0000001.
+;
+; Важно не перепутать: IddCx0102 - это НЕ версия IddCx, против которой собран
+; драйвер. Это стабильное имя службы расширения, зарегистрированное в
+;     HKLM\SYSTEM\CurrentControlSet\Control\Wdf\UMDF\IddCx\Versions\1\2
+; Оно одинаково для всех версий IddCx. Фактический уровень возможностей
+; задаётся макросами IDDCX_VERSION_MAJOR/IDDCX_VERSION_MINOR при компиляции.
+UmdfExtensions     = IddCx0102
+
+; DriverCLSID здесь намеренно отсутствует: это наследие UMDF 1.x, где драйвер
+; был COM-объектом. В UMDF 2.0 точкой входа служит экспортируемая DriverEntry,
+; а указание несуществующего CLSID заставляет хост искать класс, которого нет.
 
 [UMDriverCopy]
 PhoneMonitorIdd.dll

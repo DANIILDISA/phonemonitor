@@ -400,6 +400,7 @@ namespace pm
         }
 
         m_statsWindowStartQpc = Qpc();
+        m_framesAtWindowStart = 0;
         m_framesEncoded = m_framesSent = m_framesSkipped = 0;
         m_bytesEncoded = m_totalLatencyUs = m_maxLatencyUs = m_totalEncodeUs = 0;
 
@@ -675,8 +676,12 @@ namespace pm
         const double megabitsPerSecond = (windowSeconds > 0.0)
             ? (static_cast<double>(m_bytesEncoded) * 8.0) / windowSeconds / 1'000'000.0
             : 0.0;
+        // Частота считается по кадрам ЗА ОКНО, а не по накопительному счётчику.
+        const uint64_t framesInWindow = (frameCount >= m_framesAtWindowStart)
+            ? (frameCount - m_framesAtWindowStart)
+            : frameCount;
         const double actualFps = (windowSeconds > 0.0)
-            ? static_cast<double>(frameCount) / windowSeconds
+            ? static_cast<double>(framesInWindow) / windowSeconds
             : 0.0;
 
         PM_INFO("Сводка: кадров %llu (отправлено %llu, пропущено %llu), %.1f к/с, "
@@ -694,6 +699,7 @@ namespace pm
         // Сбрасываем окно, но не общие счётчики кадров: так видно и текущую
         // динамику, и суммарный объём работы.
         m_statsWindowStartQpc = now;
+        m_framesAtWindowStart = frameCount;
         m_bytesEncoded = 0;
         m_maxLatencyUs = 0;
     }

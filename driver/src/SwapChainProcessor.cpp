@@ -126,15 +126,42 @@ namespace pm
             PM_LOG_INFO(L"Поток swapchain переведён в класс MMCSS Distribution, приоритет CRITICAL");
         }
 
-        // Регистрируем наше устройство D3D11 в swapchain. Без этого вызова
-        // IddCxSwapChainReleaseAndAcquireBuffer вернёт STATUS_INVALID_DEVICE_STATE.
-        IDARG_IN_SWAPCHAINSETDEVICE setDevice{};
-        setDevice.pDevice = m_device->Device();
-
-        const NTSTATUS setStatus = IddCxSwapChainSetDevice(m_swapChain, &setDevice);
-        if (!NT_SUCCESS(setStatus))
+        // ---------------------------------------------------------------------
+        // Регистрация устройства в swapchain.
+        //
+        // IDARG_IN_SWAPCHAINSETDEVICE::pDevice объявлен как IDXGIDevice*, а не
+        // ID3D11Device*. Это не мелочь: IddCx работает со swapchain на уровне
+        // DXGI, и ему нужен именно интерфейс DXGI-устройства. Получаем его
+        // запросом у того же объекта - это одно и то же устройство, просто
+        // другая грань.
+        //
+        // Без этого вызова IddCxSwapChainReleaseAndAcquireBuffer вернёт
+        // STATUS_INVALID_DEVICE_STATE.
+        // ---------------------------------------------------------------------
+        ComPtr<IDXGIDevice> dxgiDevice;
+        const HRESULT queryResult = m_device->Device()->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
+        if (FAILED(queryResult))
         {
-            PM_LOG_ERROR(L"IddCxSwapChainSetDevice завершился со статусом 0x%08X", setStatus);
+            PM_LOG_ERROR(L"Устройство D3D11 не предоставляет IDXGIDevice, HRESULT=0x%08X", queryResult);
+            if (avrtHandle != nullptr)
+            {
+                AvRevertMmThreadCharacteristics(avrtHandle);
+            }
+            return;
+        }
+
+        IDARG_IN_SWAPCHAINSETDEVICE setDevice{};
+        setDevice.pDevice = dxgiDevice.Get();
+
+        // ВНИМАНИЕ о типах: функции работы со swapchain возвращают HRESULT,
+        // а не NTSTATUS, в отличие от остальных вызовов IddCx. Оба типа - это
+        // псевдонимы LONG, поэтому компилятор путаницу не ловит, а последствия
+        // тяжёлые: проверка через NT_SUCCESS считает успехом любое
+        // неотрицательное значение, и коды вроде E_PENDING трактуются неверно.
+        const HRESULT setResult = IddCxSwapChainSetDevice(m_swapChain, &setDevice);
+        if (FAILED(setResult))
+        {
+            PM_LOG_ERROR(L"IddCxSwapChainSetDevice завершился с HRESULT=0x%08X", setResult);
         }
         else
         {
@@ -177,13 +204,26 @@ namespace pm
             // переключатель контекста (~50-200 мкс) на каждом кадре.
             // -----------------------------------------------------------------
             IDARG_OUT_RELEASEANDACQUIREBUFFER buffer{};
-            const NTSTATUS acquireStatus =
+            const HRESULT acquireResult =
                 IddCxSwapChainReleaseAndAcquireBuffer(m_swapChain, &buffer);
 
-            if (acquireStatus == STATUS_PENDING)
+            // -----------------------------------------------------------------
+            // E_PENDING - ЭТО НОРМА, А НЕ ОШИБКА.
+            //
+            // Заголовок WDK формулирует это прямо: "E_PENDING indicates that
+            // there was not a new buffer to acquire". То есть рабочий стол
+            // просто не изменился с прошлого кадра.
+            //
+            // Трактовать E_PENDING как остановку дисплея - грубая ошибка:
+            // поток захвата выходит, композитор перестаёт получать
+            // подтверждения обработки кадров, IddCx считает драйвер зависшим,
+            // и система перезапускает устройство. Внешне это выглядит как
+            // "драйвер отработал ровно три кадра и умер", а в цикле
+            // перезапусков - как мигающий экран.
+            // -----------------------------------------------------------------
+            if (acquireResult == E_PENDING)
             {
-                // Новых кадров нет - рабочий стол статичен. Засыпаем на событии,
-                // которое IddCx взведёт при появлении кадра.
+                // Ждём события готовности следующего кадра.
                 const DWORD waitResult = WaitForMultipleObjects(WaitCount, waits, FALSE, 16);
 
                 if (waitResult == WAIT_OBJECT_0 + WaitTerminate)
@@ -197,17 +237,11 @@ namespace pm
                 continue;
             }
 
-            if (acquireStatus == E_PENDING || acquireStatus == STATUS_GRAPHICS_INDIRECT_DISPLAY_DEVICE_STOPPED)
-            {
-                PM_LOG_INFO(L"Косвенный дисплей остановлен системой - выходим из цикла захвата");
-                break;
-            }
-
-            if (!NT_SUCCESS(acquireStatus))
+            if (FAILED(acquireResult))
             {
                 ++m_framesFailed;
-                PM_LOG_ERROR(L"ReleaseAndAcquireBuffer вернул статус 0x%08X", acquireStatus);
-                // Ошибка захвата почти всегда означает потерю устройства
+                PM_LOG_ERROR(L"ReleaseAndAcquireBuffer вернул HRESULT=0x%08X", acquireResult);
+                // Любая иная ошибка почти всегда означает потерю устройства
                 // (смена режима, сброс драйвера GPU). Выходим: IddCx пересоздаст
                 // swapchain и заново вызовет AssignSwapChain.
                 break;
@@ -263,10 +297,10 @@ namespace pm
             // Это обязательный парный вызов к ReleaseAndAcquireBuffer. Без него
             // композитор считает кадр «в работе» и не выдаст следующий.
             // -----------------------------------------------------------------
-            const NTSTATUS finishStatus = IddCxSwapChainFinishedProcessingFrame(m_swapChain);
-            if (!NT_SUCCESS(finishStatus))
+            const HRESULT finishResult = IddCxSwapChainFinishedProcessingFrame(m_swapChain);
+            if (FAILED(finishResult))
             {
-                PM_LOG_ERROR(L"FinishedProcessingFrame вернул статус 0x%08X", finishStatus);
+                PM_LOG_ERROR(L"FinishedProcessingFrame вернул HRESULT=0x%08X", finishResult);
                 break;
             }
 

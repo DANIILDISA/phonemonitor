@@ -55,8 +55,26 @@ CMake сам проверит наличие `IddCxMonitorUpdateModes` в заг
 
 ### 2.1 Подпись и установка
 
+> **Проще всего — скриптом.** Он сам запросит права, создаст сертификат,
+> подпишет пакет, установит его и создаст узел устройства, а вывод продублирует
+> в `build\driver-install.log`:
+> ```powershell
+> powershell -NoProfile -ExecutionPolicy Bypass -File tools\install-driver.ps1
+> ```
+> Удаление — тот же скрипт с ключом `-Remove`. Ниже описано, что он делает
+> вручную, — на случай отладки.
+
 Начиная с Windows 10 1607 неподписанные драйверы не загружаются.
-Для разработки:
+
+> **Предупреждение.** Тестовый режим подписи снижает защиту системы: в нём
+> загружается любой драйвер с самоподписанным сертификатом, а не только
+> проверенный Microsoft. Включайте его на машине для разработки, а не на
+> рабочей, и выключайте, когда закончите:
+> ```powershell
+> bcdedit /set testsigning off
+> ```
+> Пока режим включён, в правом нижнем углу рабочего стола висит водяной знак
+> «Тестовый режим» — это нормально и исчезнет после выключения и перезагрузки.
 
 ```powershell
 # Один раз: включить тестовый режим и перезагрузиться
@@ -64,17 +82,43 @@ bcdedit /set testsigning on
 shutdown /r /t 0
 ```
 
-```powershell
-# Создать тестовый сертификат (один раз)
-makecert -r -pe -ss PrivateCertStore -n "CN=PhoneMonitor Test" `
-         -eku 1.3.6.1.5.5.7.3.3 phonemonitor.cer
+Создание тестового сертификата. `makecert` из старых руководств **устарел** и
+в современных версиях SDK отсутствует — используйте встроенный командлет
+PowerShell:
 
-# Собрать каталог и подписать
+```powershell
+# Один раз: создать самоподписанный сертификат подписи кода
+$cert = New-SelfSignedCertificate `
+    -Type CodeSigningCert `
+    -Subject "CN=PhoneMonitor Test" `
+    -CertStoreLocation "Cert:\CurrentUser\My" `
+    -KeyUsage DigitalSignature `
+    -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3") `
+    -NotAfter (Get-Date).AddYears(3)
+
+# Положить его в доверенные, иначе система не примет подпись
+$store = Get-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)"
+Export-Certificate -Cert $store -FilePath phonemonitor.cer | Out-Null
+Import-Certificate -FilePath phonemonitor.cer -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
+Import-Certificate -FilePath phonemonitor.cer -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" | Out-Null
+```
+
+Последние две строки обязательны и требуют прав администратора: без корневого
+сертификата в `Root` система не доверяет подписи, а без записи в
+`TrustedPublisher` установка драйвера покажет запрос, который в тихом режиме
+просто отклонится.
+
+Сборка каталога и подпись:
+
+```powershell
 cd build\driver\Release
 inf2cat /driver:. /os:10_X64
-signtool sign /v /s PrivateCertStore /n "PhoneMonitor Test" `
+signtool sign /v /fd SHA256 /s My /n "PhoneMonitor Test" `
          /t http://timestamp.digicert.com PhoneMonitor.cat
 ```
+
+`inf2cat` и `signtool` входят в WDK и лежат в
+`C:\Program Files (x86)\Windows Kits\10\bin\<версия>\x64\`.
 
 ```powershell
 # Установить пакет драйвера (от имени администратора)
@@ -183,6 +227,35 @@ adb forward tcp:6100 tcp:6100
 ```
 
 Полный список: `phonemonitor-streamer.exe --help`.
+
+---
+
+## 5a. Возврат защиты системы после работ
+
+Тестовый режим подписи и выключенный Secure Boot снижают защиту машины.
+Когда драйвер больше не нужен, восстановите их — но в правильном порядке,
+иначе BitLocker потребует ключ восстановления.
+
+```cmd
+manage-bde -protectors -disable C: -RebootCount 2
+manage-bde -protectors -disable D: -RebootCount 2
+bcdedit /set testsigning off
+```
+
+Перезагрузка → включить Secure Boot в UEFI → загрузиться → проверить:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\check-security.ps1
+```
+
+Скрипт отдельно предупреждает о самом опасном состоянии: том зашифрован,
+а защита приостановлена. Тогда ключ шифрования лежит на диске открытым, и
+шифрование не защищает ни от чего. Возобновляется одной командой без
+перезагрузки:
+
+```cmd
+manage-bde -protectors -enable C:
+```
 
 ---
 

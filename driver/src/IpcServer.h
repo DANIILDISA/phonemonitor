@@ -25,7 +25,7 @@
  *      потому что может конкурировать с публикацией кадра.
  */
 
-#include <windows.h>
+#include "DriverCommon.h"
 #include <d3d11_4.h>
 #include <wrl/client.h>
 #include <functional>

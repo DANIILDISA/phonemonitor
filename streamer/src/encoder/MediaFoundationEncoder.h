@@ -44,6 +44,10 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mftransform.h>
+// Порядок обязателен: сам интерфейс ICodecAPI объявлен в icodecapi.h,
+// а codecapi.h содержит только GUID-ы свойств и перечисления значений.
+// Без первого включения весь файл рассыпается на «необъявленный идентификатор».
+#include <icodecapi.h>
 #include <codecapi.h>
 #include <wrl/client.h>
 #include <string>
@@ -146,6 +150,10 @@ namespace pm
         std::vector<uint8_t> m_sequenceHeader;
 
         UINT m_resetToken = 0;
+        /* Принял ли конкретный MFT свойство постепенного внутрикадрового
+           обновления. Влияет только на диагностику: если не принял, значит
+           восстановление после сбоев идёт через ключевой кадр по запросу. */
+        bool m_intraRefreshActive = false;
         bool m_asyncTransform = false;
         bool m_streaming = false;
         bool m_mfStarted = false;

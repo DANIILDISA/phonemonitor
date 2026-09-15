@@ -34,9 +34,7 @@
  *  отдаёт системе виртуальный монитор и копирует кадры в разделяемую память.
  */
 
-#include <windows.h>
-#include <wdf.h>
-#include <iddcx.h>
+#include "DriverCommon.h"
 
 #include <memory>
 #include <vector>
@@ -88,8 +86,16 @@ namespace pm
          * Применяет новый режим отображения.
          * Вызывается из служебного потока IPC, когда Android прислал геометрию
          * своего экрана. Идемпотентна: повтор с теми же размерами - no-op.
+         *
+         * powerConstrained различает две причины смены режима и влияет на то,
+         * какое значение IDDCX_UPDATE_REASON получит система:
+         *   true  - тепловой троттлинг телефона (POWER_CONSTRAINTS);
+         *   false - согласование геометрии экрана (DISPLAY_LINK_BANDWIDTH).
+         * Значение не декоративное: менеджер дисплеев использует его при
+         * выборе стратегии перестроения рабочего стола.
          */
-        HRESULT ApplyDisplayMode(uint32_t width, uint32_t height, uint32_t refreshHz) noexcept;
+        HRESULT ApplyDisplayMode(uint32_t width, uint32_t height, uint32_t refreshHz,
+                                 bool powerConstrained) noexcept;
 
         /* Текущий список режимов - нужен колбэкам QueryTargetModes и
            GetDefaultDescriptionModes, которые вызываются из потоков IddCx. */
@@ -104,12 +110,19 @@ namespace pm
          *
          * Имя намеренно повторяет терминологию задачи (IddCxMonitorDisplayModesSet).
          * Реализация выбирается на этапе компиляции:
-         *   * при сборке с WDK, где доступен IddCxMonitorUpdateModes (IddCx 1.9+),
-         *     режимы обновляются «на лету» без переподключения монитора;
+         *   * при доступной IddCxMonitorUpdateModes режимы обновляются «на лету»
+         *     без переподключения монитора;
          *   * иначе выполняется корректный цикл departure -> arrival с новым
          *     EDID. Для пользователя это выглядит как переподключение кабеля.
+         *
+         * ВАЖНО о контракте IddCxMonitorUpdateModes: она принимает список
+         * ЦЕЛЕВЫХ режимов (IDDCX_TARGET_MODE), а не режимов монитора. Режимы
+         * монитора система по-прежнему получает через EDID и колбэк
+         * EvtIddCxParseMonitorDescription, поэтому при смене геометрии EDID
+         * тоже обязан быть пересобран.
          */
-        HRESULT DisplayModesSet(const std::vector<MonitorMode>& modes) noexcept;
+        HRESULT DisplayModesSet(const std::vector<MonitorMode>& modes,
+                                bool powerConstrained) noexcept;
 
         /* Создание и объявление монитора системе. */
         HRESULT CreateMonitor(const std::vector<MonitorMode>& modes) noexcept;
@@ -144,29 +157,38 @@ namespace pm
         bool m_monitorArrived = false;
     };
 
-    /*
-     * Обёртка для хранения указателя в WDF-контексте.
-     * Поле pContext уничтожается в EvtCleanupCallback соответствующего объекта.
-     */
-    struct IndirectDeviceContextWrapper
-    {
-        IndirectDeviceContext* pContext;
-
-        void Cleanup() noexcept
-        {
-            delete pContext;
-            pContext = nullptr;
-        }
-    };
-
-    struct IndirectMonitorContextWrapper
-    {
-        IndirectDeviceContext* pContext;   /* не владеем: владелец - WDFDEVICE */
-    };
 }
 
-WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(pm::IndirectDeviceContextWrapper, PmGetDeviceContext);
-WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(pm::IndirectMonitorContextWrapper, PmGetMonitorContext);
+/*
+ * Обёртки для хранения указателя в WDF-контексте.
+ *
+ * ВАЖНО, почему они объявлены в ГЛОБАЛЬНОМ пространстве имён, а не внутри pm:
+ * макрос WDF_DECLARE_CONTEXT_TYPE_WITH_NAME склеивает имя типа с префиксами,
+ * порождая идентификаторы вида _WDF_<тип>_TYPE_INFO. Если передать в него
+ * квалифицированное имя pm::Wrapper, получится синтаксически недопустимое
+ * _WDF_pm::Wrapper_TYPE_INFO, и файл перестаёт компилироваться. Тип контекста
+ * WDF обязан быть именем без квалификации.
+ *
+ * Поле pContext уничтожается в EvtCleanupCallback владеющего объекта.
+ */
+struct IndirectDeviceContextWrapper
+{
+    pm::IndirectDeviceContext* pContext;
+
+    void Cleanup() noexcept
+    {
+        delete pContext;
+        pContext = nullptr;
+    }
+};
+
+struct IndirectMonitorContextWrapper
+{
+    pm::IndirectDeviceContext* pContext;   /* не владеем: владелец - WDFDEVICE */
+};
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(IndirectDeviceContextWrapper, PmGetDeviceContext);
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(IndirectMonitorContextWrapper, PmGetMonitorContext);
 
 /* --- Точки входа, экспортируемые в WDF/IddCx ------------------------------- */
 

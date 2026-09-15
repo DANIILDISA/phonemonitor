@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <ctime>
+#include <iterator>   // std::size
 
 namespace pm
 {
@@ -136,14 +137,26 @@ namespace pm
     {
         // Кэш на поток: FormatMessage выделяет память, а нам нужно вернуть
         // указатель, живущий до следующего вызова из того же потока.
-        static thread_local char buffer[256];
+        static thread_local char buffer[512];
 
-        DWORD length = FormatMessageA(
+        // ---------------------------------------------------------------------
+        // Только широкая версия FormatMessage.
+        //
+        // FormatMessageA возвращает текст в системной кодировке ANSI (на
+        // русской Windows это CP1251), а весь наш вывод идёт в UTF-8. В
+        // результате расшифровка системной ошибки печаталась кракозябрами
+        // ровно в тот момент, когда она нужнее всего - при диагностике сбоя.
+        //
+        // Правильный путь: получить UTF-16 и явно перекодировать в UTF-8.
+        // ---------------------------------------------------------------------
+        wchar_t wide[512];
+
+        DWORD length = FormatMessageW(
             FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
             nullptr,
             static_cast<DWORD>(hr),
             MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-            buffer, sizeof(buffer) - 1, nullptr);
+            wide, static_cast<DWORD>(std::size(wide)) - 1, nullptr);
 
         if (length == 0)
         {
@@ -153,10 +166,23 @@ namespace pm
 
         // Системные сообщения заканчиваются переводом строки - убираем его,
         // иначе журнал разъезжается.
-        while (length > 0 && (buffer[length - 1] == '\n' || buffer[length - 1] == '\r'))
+        while (length > 0 && (wide[length - 1] == L'\n' || wide[length - 1] == L'\r'))
         {
-            buffer[--length] = '\0';
+            wide[--length] = L'\0';
         }
+
+        const int converted = WideCharToMultiByte(
+            CP_UTF8, 0, wide, static_cast<int>(length),
+            buffer, static_cast<int>(sizeof(buffer)) - 1, nullptr, nullptr);
+
+        if (converted <= 0)
+        {
+            snprintf(buffer, sizeof(buffer), "код 0x%08X (текст не перекодировался)",
+                static_cast<unsigned>(hr));
+            return buffer;
+        }
+
+        buffer[converted] = '\0';
         return buffer;
     }
 }

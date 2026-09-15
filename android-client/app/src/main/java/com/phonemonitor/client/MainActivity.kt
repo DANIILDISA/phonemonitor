@@ -233,6 +233,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback,
     }
 
     override fun onConnected(remoteAddress: String) {
+        // Сброс признака первого кадра ОБЯЗАТЕЛЕН на каждом подключении:
+        // иначе накладка, показанная здесь, уже никогда не скроется.
+        decoder?.onNewSession()
+
         runOnUiThread {
             updateStatus(getString(R.string.status_connected, remoteAddress), showOverlay = true)
         }

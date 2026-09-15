@@ -43,11 +43,28 @@ NTSTATUS PmEvtDriverDeviceAdd(WDFDRIVER /*driver*/, PWDFDEVICE_INIT deviceInit)
     PM_LOG_INFO(L"EvtDriverDeviceAdd: создание экземпляра виртуального дисплея");
 
     // -------------------------------------------------------------------------
-    // Шаг 1. Конфигурация расширения класса IddCx.
+    // Шаг 1. Обработчики питания - СТРОГО ПЕРЕД IddCxDeviceInitConfig.
     //
-    // IddCxDeviceInitConfig ОБЯЗАН быть вызван до WdfDeviceCreate: он
-    // подменяет ряд обработчиков в WDFDEVICE_INIT, и после создания устройства
-    // сделать это уже невозможно.
+    // Порядок здесь не косметический, а определяющий. IddCxDeviceInitConfig
+    // ставит в WDFDEVICE_INIT собственные обработчики PnP и питания, надстраивая
+    // их поверх уже заданных драйвером. Если вызвать
+    // WdfDeviceInitSetPnpPowerEventCallbacks ПОСЛЕ него, наша структура
+    // затирает всю цепочку IddCx целиком, и расширение класса перестаёт
+    // получать свои уведомления о переходах питания.
+    //
+    // Инициализацию адаптера делаем в D0Entry, а не здесь: на момент DeviceAdd
+    // стек устройства ещё не поднят, и IddCxAdapterInitAsync вернёт ошибку.
+    // -------------------------------------------------------------------------
+    WDF_PNPPOWER_EVENT_CALLBACKS pnpPower{};
+    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpPower);
+    pnpPower.EvtDeviceD0Entry = PmEvtDeviceD0Entry;
+    WdfDeviceInitSetPnpPowerEventCallbacks(deviceInit, &pnpPower);
+
+    // -------------------------------------------------------------------------
+    // Шаг 2. Конфигурация расширения класса IddCx.
+    //
+    // Вызывается до WdfDeviceCreate: после создания устройства изменить
+    // WDFDEVICE_INIT уже невозможно.
     // -------------------------------------------------------------------------
     IDD_CX_CLIENT_CONFIG iddConfig{};
     IDD_CX_CLIENT_CONFIG_INIT(&iddConfig);
@@ -66,16 +83,6 @@ NTSTATUS PmEvtDriverDeviceAdd(WDFDRIVER /*driver*/, PWDFDEVICE_INIT deviceInit)
         PM_LOG_ERROR(L"IddCxDeviceInitConfig завершился со статусом 0x%08X", status);
         return status;
     }
-
-    // -------------------------------------------------------------------------
-    // Шаг 2. Обработчики питания.
-    // Инициализацию адаптера делаем в D0Entry, а не здесь: на момент DeviceAdd
-    // стек устройства ещё не поднят, и IddCxAdapterInitAsync вернёт ошибку.
-    // -------------------------------------------------------------------------
-    WDF_PNPPOWER_EVENT_CALLBACKS pnpPower{};
-    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpPower);
-    pnpPower.EvtDeviceD0Entry = PmEvtDeviceD0Entry;
-    WdfDeviceInitSetPnpPowerEventCallbacks(deviceInit, &pnpPower);
 
     // -------------------------------------------------------------------------
     // Шаг 3. Создание WDFDEVICE с нашим контекстом.
@@ -201,7 +208,13 @@ namespace pm
             [this](uint32_t w, uint32_t h, uint32_t hz) -> HRESULT
             {
                 // Колбэк исполняется в служебном потоке IpcServer.
-                return this->ApplyDisplayMode(w, h, hz);
+                //
+                // Причину смены режима отдельным полем протокола не передаём:
+                // стример уже выставил флаги качества перед запросом, и флаг
+                // PM_QF_THERMAL_SAVE однозначно отличает тепловой троттлинг
+                // от обычного согласования геометрии.
+                const bool powerConstrained = (m_ipc.QualityFlags() & PM_QF_THERMAL_SAVE) != 0;
+                return this->ApplyDisplayMode(w, h, hz, powerConstrained);
             });
 
         if (FAILED(ipcResult))
@@ -373,7 +386,8 @@ namespace pm
     // -------------------------------------------------------------------------
     //  Смена режима по запросу клиента
     // -------------------------------------------------------------------------
-    HRESULT IndirectDeviceContext::ApplyDisplayMode(uint32_t width, uint32_t height, uint32_t refreshHz) noexcept
+    HRESULT IndirectDeviceContext::ApplyDisplayMode(uint32_t width, uint32_t height, uint32_t refreshHz,
+                                                    bool powerConstrained) noexcept
     {
         // Выравнивание под макроблоки H.264 делаем ЗДЕСЬ, а не в стримере:
         // так виртуальный монитор с самого начала имеет размер, который
@@ -399,7 +413,9 @@ namespace pm
             return S_OK;
         }
 
-        PM_LOG_INFO(L"Применение нового режима: %ux%u@%u Гц", width, height, refreshHz);
+        PM_LOG_INFO(L"Применение нового режима: %ux%u@%u Гц (причина: %s)",
+            width, height, refreshHz,
+            powerConstrained ? L"тепловое ограничение телефона" : L"согласование геометрии экрана");
 
         std::vector<MonitorMode> modes = BuildModeTable(width, height, refreshHz);
 
@@ -410,7 +426,7 @@ namespace pm
         m_activeRefresh = refreshHz;
         LeaveCriticalSection(&m_stateLock);
 
-        const HRESULT hr = DisplayModesSet(modes);
+        const HRESULT hr = DisplayModesSet(modes, powerConstrained);
         if (SUCCEEDED(hr))
         {
             m_ipc.SetActiveMode(width, height, refreshHz);
@@ -418,7 +434,8 @@ namespace pm
         return hr;
     }
 
-    HRESULT IndirectDeviceContext::DisplayModesSet(const std::vector<MonitorMode>& modes) noexcept
+    HRESULT IndirectDeviceContext::DisplayModesSet(const std::vector<MonitorMode>& modes,
+                                                   bool powerConstrained) noexcept
     {
         if (m_adapter == nullptr || modes.empty())
         {
@@ -427,38 +444,63 @@ namespace pm
 
 #if defined(PM_HAVE_IDDCX_UPDATEMODES)
         // ---------------------------------------------------------------------
-        // Быстрый путь (IddCx 1.9 и новее).
+        // Быстрый путь: обновление списка целевых режимов на лету.
         //
-        // IddCxMonitorUpdateModes заменяет список режимов монитора без его
-        // отключения: рабочий стол не мигает, окна не перераскладываются.
-        // Доступность проверяется на этапе сборки - макрос выставляет CMake,
-        // когда в заголовках WDK есть соответствующая функция.
+        // IddCxMonitorUpdateModes меняет набор режимов без отключения монитора:
+        // рабочий стол не мигает, окна не перераскладываются.
+        //
+        // Контракт функции (проверен по IddCx.h из WDK):
+        //     struct IDARG_IN_UPDATEMODES {
+        //         IDDCX_UPDATE_REASON Reason;
+        //         UINT                TargetModeCount;   // не может быть нулём
+        //         IDDCX_TARGET_MODE*  pTargetModes;
+        //     };
+        // То есть передаются ЦЕЛЕВЫЕ режимы, а не режимы монитора. Режимы
+        // монитора система получает отдельно, разбирая EDID, - поэтому выше
+        // по стеку EDID обязан быть пересобран под новую геометрию.
         // ---------------------------------------------------------------------
         if (m_monitor != nullptr && m_monitorArrived)
         {
-            std::vector<IDDCX_MONITOR_MODE> iddModes;
-            iddModes.reserve(modes.size());
+            std::vector<IDDCX_TARGET_MODE> targetModes;
+            targetModes.reserve(modes.size());
             for (const auto& m : modes)
             {
-                iddModes.push_back(CreateMonitorMode(m.width, m.height, m.refreshHz,
-                    IDDCX_MONITOR_MODE_ORIGIN_DRIVER));
+                targetModes.push_back(CreateTargetMode(m.width, m.height, m.refreshHz));
             }
 
             IDARG_IN_UPDATEMODES updateModes{};
-            updateModes.MonitorModeCount = static_cast<UINT>(iddModes.size());
-            updateModes.pMonitorModes = iddModes.data();
-            // Причина обновления: изменились возможности приёмника (телефона).
-            updateModes.Reason = IDDCX_UPDATE_REASON_OTHER;
+            updateModes.TargetModeCount = static_cast<UINT>(targetModes.size());
+            updateModes.pTargetModes = targetModes.data();
+
+            // Перечисление IDDCX_UPDATE_REASON содержит только four значения:
+            // UNINITIALIZED, POWER_CONSTRAINTS, HOST_LINK_BANDWIDTH и
+            // DISPLAY_LINK_BANDWIDTH. Универсального «прочее» в нём нет,
+            // поэтому выбираем ближайшее по смыслу:
+            //   * тепловой троттлинг телефона - это именно ограничение по
+            //     питанию и тепловыделению приёмника;
+            //   * согласование геометрии экрана - изменение возможностей
+            //     канала до устройства отображения.
+            updateModes.Reason = powerConstrained
+                ? IDDCX_UPDATE_REASON_POWER_CONSTRAINTS
+                : IDDCX_UPDATE_REASON_DISPLAY_LINK_BANDWIDTH;
 
             const NTSTATUS status = IddCxMonitorUpdateModes(m_monitor, &updateModes);
             if (NT_SUCCESS(status))
             {
-                PM_LOG_INFO(L"Список режимов обновлён без переподключения монитора");
+                PM_LOG_INFO(L"Список из %zu целевых режимов обновлён без переподключения монитора (причина %d)",
+                    targetModes.size(), static_cast<int>(updateModes.Reason));
                 return S_OK;
             }
 
             PM_LOG_WARN(L"IddCxMonitorUpdateModes вернул 0x%08X, откатываемся на переподключение", status);
         }
+#endif
+
+#if !defined(PM_HAVE_IDDCX_UPDATEMODES)
+        // В универсальном пути причина смены режима системе не сообщается -
+        // переподключение монитора не имеет такого параметра. Гасим
+        // предупреждение о неиспользуемом аргументе.
+        (void)powerConstrained;
 #endif
 
         // ---------------------------------------------------------------------
@@ -794,18 +836,27 @@ NTSTATUS PmEvtIddCxAdapterCommitModes(IDDCX_ADAPTER adapter,
 
     for (UINT i = 0; i < inArgs->PathCount; ++i)
     {
-        const IDARG_IN_COMMITMODES_PATH& path = inArgs->pPaths[i];
+        // Тип элемента массива - IDDCX_PATH. Сигнал в нём лежит напрямую
+        // (DISPLAYCONFIG_VIDEO_SIGNAL_INFO), без промежуточной обёртки, в
+        // отличие от IDDCX_TARGET_MODE, где есть вложенный targetVideoSignalInfo.
+        const IDDCX_PATH& path = inArgs->pPaths[i];
 
-        const LONG width = path.TargetVideoSignalInfo.targetVideoSignalInfo.activeSize.cx;
-        const LONG height = path.TargetVideoSignalInfo.targetVideoSignalInfo.activeSize.cy;
-        const UINT num = path.TargetVideoSignalInfo.targetVideoSignalInfo.vSyncFreq.Numerator;
-        const UINT den = path.TargetVideoSignalInfo.targetVideoSignalInfo.vSyncFreq.Denominator;
+        const LONG width = path.TargetVideoSignalInfo.activeSize.cx;
+        const LONG height = path.TargetVideoSignalInfo.activeSize.cy;
+        const UINT num = path.TargetVideoSignalInfo.vSyncFreq.Numerator;
+        const UINT den = path.TargetVideoSignalInfo.vSyncFreq.Denominator;
         const UINT hz = (den != 0) ? (num / den) : 0;
 
-        PM_LOG_INFO(L"CommitModes[%u]: активен %ldx%ld@%u Гц (активность пути: %s)",
-            i, width, height, hz, path.Active ? L"да" : L"нет");
+        // Активность пути - это бит в поле Flags, а не отдельное булево поле.
+        const bool isActive = (path.Flags & IDDCX_PATH_FLAGS_ACTIVE) != 0;
+        const bool isChanged = (path.Flags & IDDCX_PATH_FLAGS_CHANGED) != 0;
 
-        if (path.Active && context != nullptr && width > 0 && height > 0)
+        PM_LOG_INFO(L"CommitModes[%u]: %ldx%ld@%u Гц (активен: %s, изменён: %s)",
+            i, width, height, hz,
+            isActive ? L"да" : L"нет",
+            isChanged ? L"да" : L"нет");
+
+        if (isActive && context != nullptr && width > 0 && height > 0)
         {
             // Синхронизируем разделяемую память с тем, что реально выбрала
             // система: стример должен кодировать ровно этот размер.

@@ -125,5 +125,9 @@ namespace pm
         uint64_t m_maxLatencyUs = 0;
         uint64_t m_totalEncodeUs = 0;
         uint64_t m_statsWindowStartQpc = 0;
+        /* Счётчик кадров на момент начала окна. Без него частота считалась
+           делением НАКОПИТЕЛЬНОГО числа кадров на длительность одного окна,
+           и цифра росла безгранично (в журнале появлялись «826 к/с»). */
+        uint64_t m_framesAtWindowStart = 0;
     };
 }

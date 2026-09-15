@@ -44,12 +44,8 @@ namespace pm
             // Не фатально: адаптер будет найден при первом кадре.
         }
 
-        hr = AcquireSharedFence(3000);
-        if (FAILED(hr))
-        {
-            PM_WARN("Общий фенс пока недоступен, повторим при получении кадра");
-        }
-
+        // Фенс намеренно не запрашивается: синхронизация выполняется ключевым
+        // мьютексом общей текстуры (см. комментарий в AcquireFrame).
         return S_OK;
     }
 
@@ -57,27 +53,56 @@ namespace pm
     {
         const ULONGLONG deadline = GetTickCount64() + timeoutMs;
 
+        DWORD lastOpenError = 0;
+
         for (;;)
         {
-            m_section = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, PM_NAME_SECTION);
+            // ---------------------------------------------------------------
+            // Права запрашиваем МИНИМАЛЬНО НЕОБХОДИМЫЕ, а не FILE_MAP_ALL_ACCESS.
+            //
+            // FILE_MAP_ALL_ACCESS включает STANDARD_RIGHTS_REQUIRED, то есть
+            // WRITE_DAC, WRITE_OWNER и DELETE. Драйвер выдаёт прошедшим
+            // проверку пользователям только чтение, запись и выполнение
+            // (см. PM_SDDL_SHARED), поэтому запрос всех прав возвращает отказ
+            // в доступе - при полностью работающем драйвере и существующей
+            // секции. Ошибка при этом выглядит как "драйвер не найден", что
+            // уводит диагностику совершенно в другую сторону.
+            // ---------------------------------------------------------------
+            m_section = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, PM_NAME_SECTION);
             if (m_section != nullptr)
             {
                 break;
             }
 
+            lastOpenError = GetLastError();
+
             if (GetTickCount64() >= deadline)
             {
-                PM_ERROR("Секция разделяемой памяти не появилась за %u мс. "
-                         "Проверьте, установлен и запущен ли драйвер PhoneMonitor IDD", timeoutMs);
+                // Код ошибки различает два совершенно разных случая, и раньше
+                // он терялся: ERROR_FILE_NOT_FOUND - драйвера действительно нет,
+                // ERROR_ACCESS_DENIED - драйвер есть, но не отдаёт права.
+                PM_ERROR("Не удалось открыть секцию разделяемой памяти за %u мс "
+                         "(последняя ошибка %lu: %s)",
+                    timeoutMs, lastOpenError, HResultToText(HRESULT_FROM_WIN32(lastOpenError)));
+
+                if (lastOpenError == ERROR_ACCESS_DENIED)
+                {
+                    PM_ERROR("Драйвер работает, но отказывает в доступе к секции. "
+                             "Проверьте дескриптор безопасности PM_SDDL_SHARED");
+                }
+                else
+                {
+                    PM_ERROR("Проверьте, установлен и запущен ли драйвер PhoneMonitor IDD");
+                }
                 return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
             }
 
-            PM_TRACE("Ожидание драйвера...");
+            PM_TRACE("Ожидание драйвера... (код %lu)", lastOpenError);
             Sleep(kConnectPollMs);
         }
 
         m_header = static_cast<PmSharedHeader*>(
-            MapViewOfFile(m_section, FILE_MAP_ALL_ACCESS, 0, 0, PM_SECTION_SIZE));
+            MapViewOfFile(m_section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, PM_SECTION_SIZE));
         if (m_header == nullptr)
         {
             const DWORD err = GetLastError();
@@ -121,7 +146,11 @@ namespace pm
 
         for (const auto& obj : objects)
         {
-            *obj.target = OpenEventW(EVENT_ALL_ACCESS, FALSE, obj.name);
+            // EVENT_MODIFY_STATE вместо EVENT_ALL_ACCESS по той же причине, что и
+            // с секцией: EVENT_ALL_ACCESS требует STANDARD_RIGHTS_REQUIRED
+            // (WRITE_DAC, WRITE_OWNER, DELETE), которых у нас в DACL нет.
+            // Нам нужно ровно два права: взводить событие и ждать его.
+            *obj.target = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, obj.name);
             if (*obj.target == nullptr)
             {
                 const DWORD err = GetLastError();
@@ -276,7 +305,8 @@ namespace pm
             // Пробное открытие. Успех означает, что адаптер найден.
             ComPtr<ID3D11Texture2D> probe;
             hr = device1->OpenSharedResourceByName(
-                probeName, DXGI_SHARED_RESOURCE_READ, IID_PPV_ARGS(&probe));
+                probeName, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                IID_PPV_ARGS(&probe));
 
             if (FAILED(hr))
             {
@@ -420,8 +450,11 @@ namespace pm
             wchar_t name[PM_MAX_TEX_NAME];
             wcsncpy_s(name, const_cast<const wchar_t*>(m_header->slots[i].name), PM_MAX_TEX_NAME - 1);
 
+            // Право записи обязательно: без него IDXGIKeyedMutex у открытой
+            // текстуры не работает, а он и есть наш механизм синхронизации.
             const HRESULT hr = m_device1->OpenSharedResourceByName(
-                name, DXGI_SHARED_RESOURCE_READ, IID_PPV_ARGS(&m_sharedTextures[i]));
+                name, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                IID_PPV_ARGS(&m_sharedTextures[i]));
             if (FAILED(hr))
             {
                 PM_ERROR("Не удалось открыть общую текстуру %S: %s", name, HResultToText(hr));
@@ -521,16 +554,6 @@ namespace pm
             return (hr == E_PENDING) ? S_FALSE : hr;
         }
 
-        // Фенс мог быть пересоздан вместе с устройством драйвера.
-        if (!m_fence || m_fenceSerial != m_header->fenceHandleSerial)
-        {
-            hr = AcquireSharedFence(2000);
-            if (FAILED(hr))
-            {
-                return (hr == E_PENDING) ? S_FALSE : hr;
-            }
-        }
-
         // ---------------------------------------------------------------------
         // Согласованное чтение метаданных кадра.
         //
@@ -585,24 +608,48 @@ namespace pm
         }
 
         // ---------------------------------------------------------------------
-        // Синхронизация по фенсу.
+        // Синхронизация ключевым мьютексом.
         //
-        // Wait ставит в очередь НАШЕГО устройства барьер: последующие команды
-        // не начнут исполняться, пока фенс не достигнет fenceValue. Это
-        // синхронизация на стороне GPU - процессор здесь не блокируется, что и
-        // даёт выигрыш по сравнению с ожиданием через событие.
+        // Изначально здесь был общий ID3D11Fence, но передать его HANDLE между
+        // процессами не удалось: драйвер работает под ограниченной учётной
+        // записью и получает отказ в доступе при OpenProcess на наш процесс,
+        // а нам для обратного направления нужны права администратора.
+        //
+        // Ключевой мьютекс лишён этой проблемы: он принадлежит самой текстуре
+        // и открывается вместе с ней по имени. Обе стороны используют ключ 0
+        // и на захват, и на освобождение - замок работает как обычный
+        // взаимоисключающий, а наличие нового кадра сообщает frameIndex.
+        //
+        // Таймаут 12 мс: меньше периода кадра при 60 Гц. Если драйвер держит
+        // слот дольше, честнее пропустить кадр, чем копить задержку.
         // ---------------------------------------------------------------------
-        hr = m_context4->Wait(m_fence.Get(), fenceValue);
+        Microsoft::WRL::ComPtr<IDXGIKeyedMutex> keyedMutex;
+        hr = m_sharedTextures[slot].As(&keyedMutex);
         if (FAILED(hr))
         {
-            PM_ERROR("Ожидание фенса (значение %llu) не удалось: %s",
-                static_cast<unsigned long long>(fenceValue), HResultToText(hr));
+            PM_ERROR("Общая текстура слота %u не предоставляет IDXGIKeyedMutex: %s",
+                slot, HResultToText(hr));
             return hr;
+        }
+
+        hr = keyedMutex->AcquireSync(0, 12);
+        if (hr != S_OK)
+        {
+            // Слот занят писателем - не ошибка, просто берём кадр на следующей
+            // итерации. Возврат S_FALSE означает "кадра сейчас нет".
+            PM_TRACE("Слот %u занят драйвером, кадр пропущен (0x%08X)", slot, hr);
+            return S_FALSE;
         }
 
         // Копия в приватную текстуру: после неё слот можно отдавать драйверу
         // на переиспользование, а кодировщик работает со стабильными данными.
         m_context->CopyResource(m_stagingTexture.Get(), m_sharedTextures[slot].Get());
+
+        // Сброс перед освобождением замка: иначе драйвер может начать writing
+        // в слот раньше, чем наша копия реально исполнится на GPU.
+        m_context->Flush();
+
+        keyedMutex->ReleaseSync(0);
 
         m_lastFrameIndex = frameIndex;
 

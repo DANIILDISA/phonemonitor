@@ -51,8 +51,11 @@ object DisplayInfo {
      *                 с двумя экранами и для режима рабочего стола)
      */
     fun queryPhysicalGeometry(activity: Activity): ScreenGeometry {
-        var width = 0
-        var height = 0
+        // val без инициализатора: обе ветки ниже присваивают значение ровно
+        // один раз, и компилятор это проверяет. Инициализация нулём была бы
+        // не просто лишней - она замаскировала бы ветку, забывшую присвоить.
+        val width: Int
+        val height: Int
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             // ---------------------------------------------------------------

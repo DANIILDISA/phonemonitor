@@ -16,8 +16,7 @@
  *  тот режим, который запросил клиент, и помечается как предпочтительный.
  */
 
-#include <windows.h>
-#include <iddcx.h>
+#include "DriverCommon.h"
 #include <vector>
 #include <cstdint>
 

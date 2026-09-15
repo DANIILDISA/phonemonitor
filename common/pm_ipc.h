@@ -38,7 +38,7 @@
 
 /* Версия бинарного контракта. Инкрементируется при ЛЮБОМ изменении структуры.
    Стример обязан отказаться работать при несовпадении версий. */
-#define PM_IPC_VERSION      3u
+#define PM_IPC_VERSION      4u
 
 /* Количество слотов кольцевого буфера общих текстур.
    Три слота - компромисс: драйвер пишет в слот N, стример читает N-1,
@@ -51,12 +51,12 @@
 /* Имена объектов ядра. Префикс Global обязателен: драйвер живёт в сессии 0,
    стример - в интерактивной сессии пользователя, локальное пространство имён
    у них разное. */
-#define PM_NAME_SECTION     L"Global\\PhoneMonitor.SharedState.v3"
-#define PM_NAME_MUTEX       L"Global\\PhoneMonitor.Mutex.v3"
-#define PM_NAME_EVT_FRAME   L"Global\\PhoneMonitor.FrameReady.v3"
-#define PM_NAME_EVT_MODEREQ L"Global\\PhoneMonitor.ModeRequest.v3"
-#define PM_NAME_EVT_HNDREQ  L"Global\\PhoneMonitor.HandleRequest.v3"
-#define PM_NAME_EVT_HNDRDY  L"Global\\PhoneMonitor.HandleReady.v3"
+#define PM_NAME_SECTION     L"Global\\PhoneMonitor.SharedState.v4"
+#define PM_NAME_MUTEX       L"Global\\PhoneMonitor.Mutex.v4"
+#define PM_NAME_EVT_FRAME   L"Global\\PhoneMonitor.FrameReady.v4"
+#define PM_NAME_EVT_MODEREQ L"Global\\PhoneMonitor.ModeRequest.v4"
+#define PM_NAME_EVT_HNDREQ  L"Global\\PhoneMonitor.HandleRequest.v4"
+#define PM_NAME_EVT_HNDRDY  L"Global\\PhoneMonitor.HandleReady.v4"
 
 /* Шаблон имени общей текстуры: <серия пересоздания>.<номер слота>.
    Серия меняется при каждой смене режима - старые имена становятся мусором,
@@ -143,15 +143,18 @@ typedef struct PmSharedHeader
     volatile uint32_t slot;              /* индекс слота с последним кадром       */
     volatile uint32_t droppedFrames;     /* кадры, которые стример не успел взять */
 
-    /* --- Передача HANDLE фенса через дублирование --------------------------- */
-    /* Фенс нельзя открыть по имени (OpenSharedFence принимает только HANDLE),
-       поэтому используется схема запрос-ответ:
-         стример: streamerPid = GetCurrentProcessId(); SetEvent(HandleRequest)
-         драйвер: DuplicateHandle(... в процесс стримера ...);
-                  fenceHandleValue = дубликат; fenceHandleSerial++;
-                  SetEvent(HandleReady)
-       Значение fenceHandleValue валидно ТОЛЬКО в адресном пространстве
-       процесса с pid == fenceHandleOwnerPid и только для серии fenceHandleSerial. */
+    /* --- Устаревшие поля передачи хендла фенса ------------------------------- */
+    /* ИСТОРИЯ: изначально синхронизация строилась на общем ID3D11Fence, а его
+       HANDLE передавался стримеру через DuplicateHandle. Схема оказалась
+       нерабочей: драйвер живёт в WUDFHost.exe под ограниченной учётной записью
+       и получает отказ в доступе (код 5) при OpenProcess(PROCESS_DUP_HANDLE)
+       на пользовательский процесс. Обратное направление потребовало бы от
+       стримера прав администратора.
+
+       Сейчас синхронизация выполняется ключевым мьютексом (IDXGIKeyedMutex)
+       самой общей текстуры: он открывается по имени вместе с ней и не требует
+       никаких привилегий. Поля ниже сохранены только для совместимости
+       раскладки и не используются. */
     volatile uint64_t fenceHandleValue;
     volatile uint32_t fenceHandleSerial;
     volatile uint32_t fenceHandleOwnerPid;

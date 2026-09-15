@@ -15,7 +15,7 @@
  *  без них нет ID3D11Fence, а фенс - основа синхронизации со стримером.
  */
 
-#include <windows.h>
+#include "DriverCommon.h"
 #include <d3d11_4.h>
 #include <dxgi1_5.h>
 #include <wrl/client.h>
