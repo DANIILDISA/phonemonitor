@@ -1,201 +1,110 @@
 # PhoneMonitor
 
-Вторичный монитор Windows 10/11 на экране Android-устройства через USB.
+> 🇷🇺 Русская версия: [README.ru.md](README.ru.md)
 
-Система написана с нуля: драйвер косвенного дисплея, приложение-стример и
-нативный Android-клиент. Сторонних зависимостей нет — только Windows SDK/WDK
-и платформенные API Android.
+**Turn an Android phone into a second monitor for Windows 10/11 over USB — with ~26 ms end-to-end latency.**
+
+Written from scratch: a Windows indirect display driver, a streaming app and a native Android client. No third-party dependencies — only the Windows SDK/WDK and Android platform APIs.
 
 ```
-Рабочий стол Windows → виртуальный монитор (IddCx) → разделяемая видеопамять
-    → аппаратный H.264 → TCP через adb (USB) → MediaCodec → SurfaceView
+Windows desktop → virtual monitor (IddCx) → shared GPU memory
+    → hardware H.264 → TCP over adb (USB) → MediaCodec → SurfaceView
 ```
 
----
+## Status: v1.0, working
 
-## Статус: v1.0, работает
+Verified end-to-end on real hardware, not just "it compiles".
 
-Версия проверена на реальном железе сквозным прогоном, а не только сборкой.
+**Test rig:** Windows 11, Intel Arc 140T iGPU with Intel QuickSync encoder · Android 16 phone, 1216×2640 @ 120 Hz, MediaTek decoder.
 
-**Стенд:** Windows 11 26200, Intel Arc 140T iGPU, кодировщик Intel QuickSync ·
-vivo V2509A, Android 16 (API 36), экран 1216×2640 @ 120 Гц, декодер MediaTek.
-
-| Метрика | Измерено |
+| Metric | Measured |
 |---|---|
-| Задержка Windows: публикация кадра драйвером → отправка в сокет | **10,3 мс** средняя, 15,6 мс пик |
-| Кодирование (Intel QuickSync, 1080p) | 9,4 мс |
-| Декодирование на телефоне | 6–14 мс |
-| Композиция Android при 120 Гц | ~8,3 мс |
-| **Сквозная оценка** | **≈26 мс** |
-| Потери кадров за прогон (2220 кадров) | 0 на передаче, 0 на приёме |
-| Глубина очереди декодера | 0–1 пакет |
+| Windows side: driver publishes frame → socket send | **10.3 ms** avg, 15.6 ms peak |
+| Encoding (Intel QuickSync, 1080p) | 9.4 ms |
+| Decoding on the phone | 6–14 ms |
+| Android composition at 120 Hz | ~8.3 ms |
+| **End-to-end estimate** | **≈26 ms** |
+| Dropped frames per run (2,220 frames) | 0 sent, 0 received |
+| Decoder queue depth | 0–1 packets |
 
-Целевые «менее 30 мс» достигнуты при панели 120 Гц. На 60 Гц следует
-ожидать ≈34 мс: композиция Android даёт один период панели и является
-крупнейшим неустранимым слагаемым.
+The < 30 ms target is met on a 120 Hz panel. At 60 Hz expect ≈34 ms: Android composition costs one panel period and is the largest irreducible term.
 
-### Что работает
+### What works
 
-- Драйвер поднимает виртуальный монитор, Windows разбирает сгенерированный EDID
-  и создаёт устройство `DISPLAY\PMN0001`.
-- Кадры передаются в разделяемой видеопамяти без единой копии через системную.
-- Клиент получает поток, декодирует аппаратно и выводит на `SurfaceView`.
-- Согласование геометрии, отчёт о нагреве, автоматический `adb forward`,
-  переподключение после разрыва.
+- The driver exposes a virtual monitor; Windows parses the generated EDID and creates the `DISPLAY\PMN0001` device.
+- Frames travel through shared GPU memory with **zero copies through system RAM**.
+- The client receives the stream, decodes it in hardware and renders to a `SurfaceView`.
+- Geometry negotiation, thermal reporting, automatic `adb forward`, reconnect after disconnect.
 
-### Что не доделано
+### Known limitations
 
-1. **Активное разрешение не переключается.** Драйвер объявляет системе новый
-   список режимов и рапортует об успехе, но Windows оставляет монитор на
-   1920×1080. На телефон идёт 1080p, растянутый на его экран. Смена списка
-   режимов не равна переключению активного режима — нужен явный `SetDisplayConfig`.
-2. **Гонка при первом назначении swapchain.** `IddCxSwapChainSetDevice`
-   возвращает `0x887A0026`, повторное назначение проходит нормально. Внешне
-   незаметно.
-3. **Intra-Refresh на Intel QuickSync** принимается только как флаг: шаг волны
-   выбирает сам кодировщик. Вариант с явным числом кадров отвергается.
+1. **Active resolution doesn't switch** — the driver publishes a new mode list, but Windows keeps the monitor at 1920×1080; an explicit `SetDisplayConfig` call is needed.
+2. **First swapchain assignment race** — `IddCxSwapChainSetDevice` returns `0x887A0026` once, the retry succeeds. Invisible to the user.
+3. **Intra-Refresh on Intel QuickSync** is accepted only as a flag; the encoder picks the wave step itself.
 
----
+## Key engineering decisions
 
-## Быстрый старт
+- **The driver never encodes or touches the network.** `WUDFHost.exe` is supervised by the PnP manager — any long operation there causes a device start timeout. The driver does exactly two things: exposes the virtual monitor and copies frames into shared GPU memory.
+- **Frames never leave GPU memory on the Windows side.** The driver copies the swapchain surface into a shared texture; the streamer opens it on the same adapter and feeds it straight to the encoder.
+- **Keyed mutex instead of a fence.** A shared `ID3D11Fence` with `DuplicateHandle` failed: the driver runs under a restricted account and can't `OpenProcess` the user process, while the reverse direction needs admin rights. `IDXGIKeyedMutex` belongs to the texture itself, opens by name and needs no privileges.
+- **The phone dictates the resolution.** The client's first packet reports both screen geometry **and the hardware decoder limit** — many 2400×1080 phones can only decode up to 1920×1080.
+- **No latency hidden in buffers.** Encoder VBV = 1 frame, `SO_SNDBUF` = 2 frames, decoder queue = 8 NALs. A big buffer doesn't remove congestion — it turns it into hidden latency.
+- **React to heat on the first signal.** `THERMAL_STATUS_LIGHT` switches to 720p; waiting for hard throttling is too late.
 
-### Что понадобится
+## Encoder support
 
-| Компонент | Зачем |
-|---|---|
-| Visual Studio 2022 Build Tools, нагрузка «Разработка классических приложений на C++» | компилятор и Windows SDK |
-| Windows Driver Kit той же версии, что SDK | только для драйвера |
-| CMake 3.21+ | сборка |
-| Android SDK Platform-Tools | `adb` |
-| JDK 17 + Android SDK (или Android Studio) | сборка клиента |
+| GPU | Path | Intra-Refresh |
+|---|---|---|
+| NVIDIA | NVENC directly (`nvEncodeAPI64.dll`, loaded dynamically) | 5 % frame-width stripe, precise control |
+| AMD | Media Foundation MFT (official AMF wrapper) | via `CODECAPI_AVEncVideoGradualIntraRefresh` |
+| Intel | Media Foundation MFT (QuickSync) | flag only, encoder picks the step |
 
-Прямые ссылки и разбор частых граблей — в [`docs/BUILD.md`](docs/BUILD.md).
+## Components
 
-### 1. Собрать
+| Directory | Component | Technologies |
+|---|---|---|
+| `driver/` | Indirect display driver | UMDF 2.0, IddCx 1.10, D3D11.4, C++17 |
+| `streamer/` | Streaming app | Win32, NVENC / Media Foundation, Winsock, C++17 |
+| `android-client/` | Client | Kotlin, MediaCodec, SurfaceView, minSdk 26 |
+| `common/` | Shared contracts | `pm_ipc.h` (v4), `pm_protocol.h` (v1) |
+| `tools/` | Scripts | driver install, security check, progress indicator |
+| `docs/` | Docs | architecture, build, diagnostics (in Russian) |
+
+## Quick start
+
+**Requirements:** Visual Studio 2022 Build Tools (C++ desktop workload), Windows Driver Kit matching the SDK, CMake 3.21+, Android SDK Platform-Tools (`adb`), JDK 17 + Android SDK. Details and common pitfalls: [`docs/BUILD.md`](docs/BUILD.md).
 
 ```powershell
+# 1. Build
 cmake -S driver   -B build/driver   -A x64 && cmake --build build/driver   --config Release
 cmake -S streamer -B build/streamer -A x64 && cmake --build build/streamer --config Release
 cd android-client && .\gradlew.bat assembleDebug
-```
 
-### 2. Разрешить загрузку самоподписанного драйвера
-
-> **Это снижает защиту машины.** Secure Boot придётся выключить в UEFI, а если
-> включён BitLocker — **сначала** сохранить ключ восстановления и приостановить
-> защиту, иначе следующая загрузка потребует 48-значный пароль. Подробный
-> безопасный порядок — в [`docs/BUILD.md`](docs/BUILD.md), раздел 2.1.
-
-```cmd
+# 2. Allow test-signed drivers (see the warning below), then reboot
 bcdedit /set testsigning on
-```
-затем перезагрузка.
 
-Проверить состояние защиты в любой момент:
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\check-security.ps1
-```
-
-### 3. Подписать и установить драйвер
-
-```powershell
+# 3. Sign and install the driver (creates a test certificate; -Remove to uninstall)
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\install-driver.ps1
-```
 
-Скрипт сам запросит права, создаст тестовый сертификат, подпишет пакет,
-установит его и создаст узел устройства. Вывод дублируется в
-`build\driver-install.log`.
-
-Удалить: тот же скрипт с ключом `-Remove`.
-
-### 4. Поставить клиент и запустить
-
-```powershell
+# 4. Install the client, start the app on the phone, then run the streamer
 adb install -r android-client\app\build\outputs\apk\debug\app-debug.apk
-```
-
-Запустите приложение на телефоне (оно откроет порт 6100 и будет ждать), затем
-на компьютере:
-
-```powershell
 build\streamer\Release\phonemonitor-streamer.exe
 ```
 
-Если `adb` не в `PATH`, укажите путь: `--adb "C:\путь\к\adb.exe"`.
+> ⚠️ **Test signing lowers system protection.** Secure Boot must be disabled in UEFI; if BitLocker is enabled, **save the recovery key and suspend protection first**, or the next boot will ask for the 48-digit key. Safe order of steps: [`docs/BUILD.md`](docs/BUILD.md), section 2.1. Check the current state any time with `tools\check-security.ps1`.
 
-Полный список ключей: `phonemonitor-streamer.exe --help`.
+## Diagnostics
 
----
-
-## Состав
-
-| Каталог | Компонент | Технологии |
-|---|---|---|
-| `driver/` | Драйвер косвенного дисплея | UMDF 2.0, IddCx 1.10, D3D11.4, C++17 |
-| `streamer/` | Приложение-стример | Win32, NVENC / Media Foundation, Winsock, C++17 |
-| `android-client/` | Клиент | Kotlin, MediaCodec, SurfaceView, minSdk 26 |
-| `common/` | Общие контракты | `pm_ipc.h` (v4), `pm_protocol.h` (v1) |
-| `tools/` | Скрипты | установка драйвера, проверка защиты, индикатор прогресса |
-| `docs/` | Документация | архитектура, сборка, диагностика |
-
----
-
-## Ключевые решения
-
-**Драйвер не кодирует и не работает с сетью.** `WUDFHost.exe` находится под
-надзором PnP-менеджера: длительная операция в нём приводит к таймауту старта
-устройства. Драйвер делает ровно две вещи — отдаёт системе виртуальный монитор
-и копирует кадры в разделяемую видеопамять.
-
-**Кадр не покидает видеопамять на всём пути Windows.** Драйвер копирует
-поверхность swapchain в общую текстуру, стример открывает её на том же
-адаптере и отдаёт прямо в кодировщик.
-
-**Синхронизация ключевым мьютексом, а не фенсом.** Исходно проект использовал
-общий `ID3D11Fence` с передачей `HANDLE` через `DuplicateHandle`. Схема
-оказалась нерабочей: драйвер живёт под ограниченной учётной записью и получает
-отказ в доступе при `OpenProcess` на пользовательский процесс, а обратное
-направление требует прав администратора. `IDXGIKeyedMutex` принадлежит самой
-текстуре, открывается вместе с ней по имени и не требует никаких привилегий.
-
-**Разрешение диктует телефон.** Клиент первым пакетом сообщает геометрию экрана
-**и предел аппаратного декодера** — это разные вещи, и устройства с экраном
-2400×1080 нередко имеют декодер до 1920×1080.
-
-**Задержка не прячется в буферах.** VBV кодировщика — один кадр, `SO_SNDBUF` —
-два кадра, очередь декодера — восемь NAL. Большой буфер не устраняет затор,
-а превращает его в скрытую задержку.
-
-**Реакция на нагрев — на первом же сигнале.** `THERMAL_STATUS_LIGHT` включает
-режим 720p. Ждать жёсткого троттлинга нельзя: из него система не выходит, пока
-не остынет.
-
----
-
-## Поддержка кодировщиков
-
-| GPU | Путь | Intra-Refresh |
-|---|---|---|
-| NVIDIA | NVENC напрямую (`nvEncodeAPI64.dll`, динамическая загрузка) | полоса 5 % ширины кадра, точный контроль |
-| AMD | Media Foundation MFT (официальная обёртка над AMF) | через `CODECAPI_AVEncVideoGradualIntraRefresh` |
-| Intel | Media Foundation MFT (QuickSync) | принимается флагом, шаг выбирает кодировщик |
-
----
-
-## Диагностика
-
-| Где | Что смотреть |
+| Where | What |
 |---|---|
-| `C:\ProgramData\PhoneMonitor\driver.log` | журнал драйвера, каждый шаг с меткой времени |
-| `build\driver-install.log` | результат установки драйвера |
-| `build\security-status.log` | состояние BitLocker, Secure Boot, тестовой подписи |
-| вывод стримера | сводка каждые N кадров: частота, битрейт, задержка |
-| `adb logcat -s PhoneMonitor:V VideoDecoder:V StreamServer:V` | журнал клиента |
+| `C:\ProgramData\PhoneMonitor\driver.log` | driver log, every step timestamped |
+| `build\driver-install.log` | driver install result |
+| `build\security-status.log` | BitLocker, Secure Boot, test-signing state |
+| streamer output | periodic summary: frame rate, bitrate, latency |
+| `adb logcat -s PhoneMonitor:V VideoDecoder:V StreamServer:V` | client log |
 
-Разбор типовых отказов — в [`docs/BUILD.md`](docs/BUILD.md), раздел 6.
+Code comments and log output are in Russian.
 
----
+## Author
 
-## Язык кода
-
-Все комментарии в исходниках и весь вывод журналов — на русском языке.
+**Daniil Burnashov**
